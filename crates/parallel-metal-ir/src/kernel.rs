@@ -8,11 +8,17 @@ pub struct ScalarParam {
     pub ty: ScalarType,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelInput {
+    pub ty: ScalarType,
+    pub rank: usize,
+}
+
 /// A single shape-preserving element kernel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ElementKernel {
     pub name: String,
-    pub inputs: Vec<ScalarType>,
+    pub inputs: Vec<KernelInput>,
     pub scalars: Vec<ScalarParam>,
     pub output: ScalarType,
     /// Rank to reconstruct inside the kernel when the expression observes a point.
@@ -29,18 +35,28 @@ impl ElementKernel {
         source.push_str(self.output.msl_name());
         source.push_str("* __pm_out [[buffer(0)]],\n");
 
-        for (index, ty) in self.inputs.iter().enumerate() {
+        for (index, input) in self.inputs.iter().enumerate() {
             writeln!(
                 source,
                 "    const device {}* __pm_in{} [[buffer({})]],",
-                ty.msl_name(),
+                input.ty.msl_name(),
                 index,
                 index + 1
             )
             .unwrap();
         }
 
-        let scalar_start = self.inputs.len() + 1;
+        let input_extent_start = self.inputs.len() + 1;
+        for (index, _) in self.inputs.iter().enumerate() {
+            writeln!(
+                source,
+                "    constant uint* __pm_in{index}_extent [[buffer({})]],",
+                input_extent_start + index
+            )
+            .unwrap();
+        }
+
+        let scalar_start = self.inputs.len() * 2 + 1;
         for (index, scalar) in self.scalars.iter().enumerate() {
             writeln!(
                 source,
@@ -92,13 +108,22 @@ impl ElementKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BinaryOp, DeviceBlock, Expr};
+    use crate::{AssignOp, BinaryOp, DeviceBlock, Expr, Statement};
 
     #[test]
     fn emits_zip_xor_kernel() {
         let kernel = ElementKernel {
             name: "xor".into(),
-            inputs: vec![ScalarType::U64, ScalarType::U64],
+            inputs: vec![
+                KernelInput {
+                    ty: ScalarType::U64,
+                    rank: 1,
+                },
+                KernelInput {
+                    ty: ScalarType::U64,
+                    rank: 1,
+                },
+            ],
             scalars: vec![],
             output: ScalarType::U64,
             logical_rank: None,
@@ -115,8 +140,9 @@ mod tests {
         let source = kernel.to_msl();
         assert!(source.contains("const device ulong* __pm_in1 [[buffer(2)]]"));
         assert!(source.contains("__pm_in0[__pm_linear] ^ __pm_in1[__pm_linear]"));
-        assert!(source.contains("constant uint& __pm_count [[buffer(3)]]"));
-        assert!(source.contains("constant uint* __pm_extent [[buffer(4)]]"));
+        assert!(source.contains("constant uint* __pm_in1_extent [[buffer(4)]]"));
+        assert!(source.contains("constant uint& __pm_count [[buffer(5)]]"));
+        assert!(source.contains("constant uint* __pm_extent [[buffer(6)]]"));
     }
 
     #[test]
@@ -138,5 +164,62 @@ mod tests {
         assert!(source.contains("uint __pm_point1 = __pm_remaining % __pm_extent[1]"));
         assert!(source.contains("__pm_remaining /= __pm_extent[0]"));
         assert!(source.contains("__pm_out[__pm_linear] = __pm_point1"));
+    }
+
+    #[test]
+    fn emits_indexed_input_and_dynamic_sum_loop() {
+        let inputs = vec![
+            KernelInput {
+                ty: ScalarType::F32,
+                rank: 2,
+            },
+            KernelInput {
+                ty: ScalarType::F32,
+                rank: 2,
+            },
+        ];
+        let kernel = ElementKernel {
+            name: "matmul".into(),
+            inputs,
+            scalars: vec![],
+            output: ScalarType::F32,
+            logical_rank: Some(2),
+            body: DeviceBlock {
+                statements: vec![
+                    Statement::Let {
+                        name: "sum".into(),
+                        ty: ScalarType::F32,
+                        value: Expr::Literal("0.0f".into()),
+                    },
+                    Statement::ForRange {
+                        variable: "k".into(),
+                        start: Expr::Literal("0".into()),
+                        end: Expr::InputExtentAxis { input: 0, axis: 0 },
+                        inclusive: false,
+                        body: vec![Statement::Assign {
+                            name: "sum".into(),
+                            op: AssignOp::Add,
+                            value: Expr::Binary {
+                                op: BinaryOp::Mul,
+                                left: Box::new(Expr::InputAt {
+                                    input: 0,
+                                    coordinates: vec![Expr::Local("k".into()), Expr::PointAxis(1)],
+                                }),
+                                right: Box::new(Expr::InputAt {
+                                    input: 1,
+                                    coordinates: vec![Expr::PointAxis(0), Expr::Local("k".into())],
+                                }),
+                            },
+                        }],
+                    },
+                ],
+                result: Expr::Local("sum".into()),
+            },
+        };
+
+        let source = kernel.to_msl();
+        assert!(source.contains("for (uint k = 0; k < __pm_in0_extent[0]; ++k)"));
+        assert!(source.contains("__pm_in0[k + __pm_in0_extent[0] * (__pm_point1)]"));
+        assert!(source.contains("__pm_in1[__pm_point0 + __pm_in1_extent[0] * (k)]"));
     }
 }

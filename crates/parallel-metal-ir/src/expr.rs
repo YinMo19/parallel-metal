@@ -6,6 +6,14 @@ use crate::{BinaryOp, ScalarType, UnaryOp};
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Input(usize),
+    InputAt {
+        input: usize,
+        coordinates: Vec<Self>,
+    },
+    InputExtentAxis {
+        input: usize,
+        axis: usize,
+    },
     PointAxis(usize),
     ExtentAxis(usize),
     Scalar(String),
@@ -40,6 +48,14 @@ impl Expr {
         match self {
             Self::Input(index) => {
                 write!(output, "__pm_in{index}[__pm_linear]").unwrap();
+            }
+            Self::InputAt { input, coordinates } => {
+                write!(output, "__pm_in{input}[").unwrap();
+                write_input_offset(output, *input, coordinates, 0);
+                output.push(']');
+            }
+            Self::InputExtentAxis { input, axis } => {
+                write!(output, "__pm_in{input}_extent[{axis}]").unwrap();
             }
             Self::PointAxis(axis) => {
                 write!(output, "__pm_point{axis}").unwrap();
@@ -97,5 +113,14 @@ impl Expr {
                 output.push(')');
             }
         }
+    }
+}
+
+fn write_input_offset(output: &mut String, input: usize, coordinates: &[Expr], axis: usize) {
+    coordinates[axis].write_msl(output);
+    if axis + 1 < coordinates.len() {
+        write!(output, " + __pm_in{input}_extent[{axis}] * (").unwrap();
+        write_input_offset(output, input, coordinates, axis + 1);
+        output.push(')');
     }
 }

@@ -65,9 +65,11 @@ offset 是 `x + width * y`，三维 offset 是 `x + width * (y + height * z)`。
 - `tensor.indexed_parallel_iter()` 的 N 维逻辑坐标；
 - `extent.parallel_iter()` 的无输入 N 维生成；
 - 坐标既可写成 `|point| point[0]`，也可按 rank 解构成 `|(x, y)|`；
+- parallel chain 前可以执行普通 host 端 shape 检查和输出 extent 推导；
+- device closure 可以用 `tensor[(x, y, ...)]` 只读访问输入 tensor；
 - primitive integer 和 `f32` 的算术、比较、位运算、cast 和简单 `if` 表达式；
-- 显式类型的 scalar local、`let mut`/赋值、字面量范围 `for` 循环和
-  `(0..8).for_each(...)`；
+- 显式类型的 scalar local、`let mut`/赋值、有界范围 `for`/`for_each`，以及局部
+  `(range).map(...).sum()`；
 - `sin`、`cos`、`abs`、`exp` 和 `tanh` device math intrinsic；
 - MSL 生成、首次调用编译、thread-local pipeline cache 和同步执行。
 
@@ -90,16 +92,25 @@ cargo test --workspace
 cargo run --release -p parallel-metal --example xor
 cargo run --release -p parallel-metal --example pixels
 cargo run --release -p parallel-metal --example shader
+cargo run --release -p parallel-metal --example matmul
 ```
 
 `shader` example 是一段 ShaderToy 风格流体光球公式的标量化 Rust 翻译。GPU 逐像素执行，
 CPU zero-copy 读取结果并写到 `/tmp/parallel-metal-shader.ppm`。
 
+`matmul` example 用普通函数式 Rust 形状表达朴素矩阵乘法：host 端检查 shape，GPU closure
+中按坐标读取两个输入，并用 `(0..left.extent()[0]).map(...).sum()` 计算 dot product。它是
+语义案例，不是高性能 tiled GEMM。
+
 ## 当前明确限制
 
 - 一个 chain 目前只支持一个 `map`，输入为一个 tensor、两个 tensor 的一次 zip，或一个
   `Extent`；
+- 局部 iterator 目前只实现 range `for`/`for_each` 和直接作为 map 结果的
+  `(range).map(...).sum()`；
+- tensor 坐标读取尚未自动插入 bounds check 或证明索引安全，当前由 host shape 检查负责；
 - `reduce`、`scan`、`filter`、`flat_map`、in-place kernel 和跨 chain fusion 尚未实现；
+- 矩阵乘法还是逐输出元素的朴素 kernel，尚无 threadgroup tiling、向量化或专用调度；
 - tensor element 和 scalar 目前只支持内置整数与 `f32`，`#[derive(MetalElement)]` 尚未实现；
 - runtime 当前同步等待 GPU；
 - GPU 初始化、MSL 编译或 command 执行失败时目前 panic，设计中的 CPU fallback 尚未接入；

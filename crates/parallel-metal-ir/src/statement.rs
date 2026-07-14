@@ -37,8 +37,8 @@ pub enum Statement {
     },
     ForRange {
         variable: String,
-        start: u32,
-        end: u32,
+        start: Expr,
+        end: Expr,
         inclusive: bool,
         body: Vec<Self>,
     },
@@ -66,11 +66,11 @@ impl Statement {
                 body,
             } => {
                 let comparison = if *inclusive { "<=" } else { "<" };
-                writeln!(
-                    output,
-                    "{indent}for (uint {variable} = {start}; {variable} {comparison} {end}; ++{variable}) {{"
-                )
-                .unwrap();
+                write!(output, "{indent}for (uint {variable} = ").unwrap();
+                start.write_msl(output);
+                write!(output, "; {variable} {comparison} ").unwrap();
+                end.write_msl(output);
+                writeln!(output, "; ++{variable}) {{").unwrap();
                 for statement in body {
                     statement.write_msl(output, indentation + 1);
                 }

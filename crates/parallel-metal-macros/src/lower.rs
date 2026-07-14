@@ -15,36 +15,26 @@ struct LocalInfo {
     mutable: bool,
 }
 
-struct DeviceContext<'a> {
-    bindings: &'a HashMap<String, usize>,
-    point_binding: Option<&'a str>,
-    point_axes: &'a HashMap<String, usize>,
-    extent_names: &'a [String],
-    logical_rank: Option<usize>,
-    scalars: &'a HashMap<String, ScalarType>,
+pub(crate) struct DeviceContext<'a> {
+    pub(crate) bindings: &'a HashMap<String, usize>,
+    pub(crate) tensor_bindings: &'a HashMap<String, (usize, usize)>,
+    pub(crate) point_binding: Option<&'a str>,
+    pub(crate) point_axes: &'a HashMap<String, usize>,
+    pub(crate) extent_names: &'a [String],
+    pub(crate) logical_rank: Option<usize>,
+    pub(crate) scalars: &'a HashMap<String, ScalarType>,
+    pub(crate) result_type: ScalarType,
 }
 
 pub(crate) fn lower_device_body(
     expression: &Expr,
-    bindings: &HashMap<String, usize>,
-    point_binding: Option<&str>,
-    point_axes: &HashMap<String, usize>,
-    extent_names: &[String],
-    logical_rank: Option<usize>,
-    scalars: &HashMap<String, ScalarType>,
+    context: DeviceContext<'_>,
 ) -> syn::Result<DeviceBlock> {
-    let context = DeviceContext {
-        bindings,
-        point_binding,
-        point_axes,
-        extent_names,
-        logical_rank,
-        scalars,
-    };
     let mut locals = HashMap::new();
 
     if let Expr::Block(block) = expression {
-        let (statements, result) = lower_block_parts(&block.block, &context, &mut locals)?;
+        let (statements, result) =
+            lower_block_parts(&block.block, &context, &mut locals, context.result_type)?;
         let result = result.ok_or_else(|| {
             syn::Error::new_spanned(
                 &block.block,
@@ -53,10 +43,9 @@ pub(crate) fn lower_device_body(
         })?;
         Ok(DeviceBlock { statements, result })
     } else {
-        Ok(DeviceBlock {
-            statements: vec![],
-            result: lower_expression(expression, &context, &locals)?,
-        })
+        let (statements, result) =
+            lower_result_expression(expression, &context, &locals, context.result_type)?;
+        Ok(DeviceBlock { statements, result })
     }
 }
 
@@ -64,6 +53,7 @@ fn lower_block_parts(
     block: &Block,
     context: &DeviceContext<'_>,
     locals: &mut HashMap<String, LocalInfo>,
+    result_type: ScalarType,
 ) -> syn::Result<(Vec<Statement>, Option<IrExpr>)> {
     let mut statements = Vec::new();
     let mut result = None;
@@ -74,7 +64,10 @@ fn lower_block_parts(
             Stmt::Local(local) => statements.push(lower_local(local, context, locals)?),
             Stmt::Expr(expression, semicolon) => {
                 if semicolon.is_none() && is_last && !matches!(expression, Expr::ForLoop(_)) {
-                    result = Some(lower_expression(expression, context, locals)?);
+                    let (prefix, expression) =
+                        lower_result_expression(expression, context, locals, result_type)?;
+                    statements.extend(prefix);
+                    result = Some(expression);
                 } else {
                     statements.push(lower_statement(expression, context, locals)?);
                 }
@@ -95,6 +88,96 @@ fn lower_block_parts(
     }
 
     Ok((statements, result))
+}
+
+fn lower_result_expression(
+    expression: &Expr,
+    context: &DeviceContext<'_>,
+    locals: &HashMap<String, LocalInfo>,
+    result_type: ScalarType,
+) -> syn::Result<(Vec<Statement>, IrExpr)> {
+    if let Some((range, closure)) = range_map_sum(expression)? {
+        let (start, end, inclusive) = lower_range(range, context, locals)?;
+        let variable = simple_pat_ident(&closure.inputs[0])?;
+        let rust_name = variable.to_string();
+        let msl_name = loop_msl_identifier(&rust_name);
+        let mut loop_locals = locals.clone();
+        loop_locals.insert(
+            rust_name,
+            LocalInfo {
+                msl_name: msl_name.clone(),
+                mutable: false,
+            },
+        );
+        let value = if let Expr::Block(block) = closure.body.as_ref() {
+            lower_pure_block_expression(&block.block, context, &loop_locals)?
+        } else {
+            lower_expression(&closure.body, context, &loop_locals)?
+        };
+        let sum_name = "__pm_range_sum".to_owned();
+        let zero = if result_type == ScalarType::F32 {
+            "0.0f"
+        } else {
+            "0"
+        };
+        Ok((
+            vec![
+                Statement::Let {
+                    name: sum_name.clone(),
+                    ty: result_type,
+                    value: IrExpr::Literal(zero.to_owned()),
+                },
+                Statement::ForRange {
+                    variable: msl_name,
+                    start,
+                    end,
+                    inclusive,
+                    body: vec![Statement::Assign {
+                        name: sum_name.clone(),
+                        op: AssignOp::Add,
+                        value,
+                    }],
+                },
+            ],
+            IrExpr::Local(sum_name),
+        ))
+    } else {
+        Ok((vec![], lower_expression(expression, context, locals)?))
+    }
+}
+
+fn range_map_sum(expression: &Expr) -> syn::Result<Option<(&Expr, &ExprClosure)>> {
+    let Expr::MethodCall(sum) = expression else {
+        return Ok(None);
+    };
+    if sum.method != "sum" || !sum.args.is_empty() {
+        return Ok(None);
+    }
+    let Expr::MethodCall(map) = sum.receiver.as_ref() else {
+        return Err(syn::Error::new_spanned(
+            &sum.receiver,
+            "device sum currently requires `(range).map(...).sum()`",
+        ));
+    };
+    if map.method != "map" || map.args.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            map,
+            "device sum currently requires exactly one range map closure",
+        ));
+    }
+    let Expr::Closure(closure) = &map.args[0] else {
+        return Err(syn::Error::new_spanned(
+            &map.args[0],
+            "device range map requires an inline closure",
+        ));
+    };
+    if closure.inputs.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &closure.inputs,
+            "device range map closure must have exactly one argument",
+        ));
+    }
+    Ok(Some((&map.receiver, closure)))
 }
 
 fn lower_local(
@@ -199,7 +282,7 @@ fn lower_for_loop(
     outer_locals: &HashMap<String, LocalInfo>,
 ) -> syn::Result<Statement> {
     let variable = simple_pat_ident(&loop_expression.pat)?;
-    let (start, end, inclusive) = fixed_range(&loop_expression.expr)?;
+    let (start, end, inclusive) = lower_range(&loop_expression.expr, context, outer_locals)?;
 
     let rust_name = variable.to_string();
     let msl_name = loop_msl_identifier(&rust_name);
@@ -247,7 +330,7 @@ fn lower_for_each(
     }
 
     let variable = simple_pat_ident(&closure.inputs[0])?;
-    let (start, end, inclusive) = fixed_range(receiver)?;
+    let (start, end, inclusive) = lower_range(receiver, context, outer_locals)?;
     let rust_name = variable.to_string();
     let msl_name = loop_msl_identifier(&rust_name);
     let mut locals = outer_locals.clone();
@@ -310,7 +393,11 @@ fn lower_unit_block(
     Ok(statements)
 }
 
-fn fixed_range(expression: &Expr) -> syn::Result<(u32, u32, bool)> {
+fn lower_range(
+    expression: &Expr,
+    context: &DeviceContext<'_>,
+    locals: &HashMap<String, LocalInfo>,
+) -> syn::Result<(IrExpr, IrExpr, bool)> {
     let expression = strip_grouping(expression);
     let Expr::Range(ExprRange {
         start: Some(start),
@@ -321,13 +408,14 @@ fn fixed_range(expression: &Expr) -> syn::Result<(u32, u32, bool)> {
     else {
         return Err(syn::Error::new_spanned(
             expression,
-            "device loops require a bounded literal range such as 0..8 or 1..=8",
+            "device loops require a bounded range such as 0..count or 1..=8",
         ));
     };
-    let start = integer_literal(start)?;
-    let end = integer_literal(end)?;
+    let start = lower_expression(start, context, locals)?;
+    let end_expression = end;
+    let end = lower_expression(end_expression, context, locals)?;
     let inclusive = matches!(limits, RangeLimits::Closed(_));
-    if inclusive && end == u32::MAX {
+    if inclusive && integer_literal(end_expression) == Some(u32::MAX) {
         return Err(syn::Error::new_spanned(
             expression,
             "an inclusive device loop cannot end at u32::MAX",
@@ -382,19 +470,46 @@ fn lower_expression(
 ) -> syn::Result<IrExpr> {
     match expression {
         Expr::Index(index) => {
+            if let Expr::MethodCall(extent) = index.expr.as_ref()
+                && extent.method == "extent"
+                && extent.args.is_empty()
+                && let Expr::Path(tensor) = extent.receiver.as_ref()
+                && tensor.path.segments.len() == 1
+            {
+                let tensor = tensor.path.segments[0].ident.to_string();
+                if let Some(&(input, rank)) = context.tensor_bindings.get(&tensor) {
+                    let axis = index_literal(&index.index)?;
+                    if axis >= rank {
+                        return Err(syn::Error::new_spanned(
+                            &index.index,
+                            format!("axis {axis} is out of bounds for rank {rank}"),
+                        ));
+                    }
+                    return Ok(IrExpr::InputExtentAxis { input, axis });
+                }
+            }
+
             let Expr::Path(base) = index.expr.as_ref() else {
                 return Err(syn::Error::new_spanned(
                     index,
-                    "device indexing currently supports Point and Extent values",
+                    "device indexing requires a simple Tensor, Point, or Extent identifier",
                 ));
             };
             if base.path.segments.len() != 1 {
                 return Err(syn::Error::new_spanned(
                     base,
-                    "device Point/Extent indexing requires a simple identifier",
+                    "device indexing requires a simple identifier",
                 ));
             }
             let base = base.path.segments[0].ident.to_string();
+            if let Some(&(input, rank)) = context.tensor_bindings.get(&base) {
+                let coordinates = tensor_coordinates(&index.index, rank)?
+                    .iter()
+                    .map(|coordinate| lower_expression(coordinate, context, locals))
+                    .collect::<syn::Result<Vec<_>>>()?;
+                return Ok(IrExpr::InputAt { input, coordinates });
+            }
+
             let axis = index_literal(&index.index)?;
             let rank = context.logical_rank.ok_or_else(|| {
                 syn::Error::new_spanned(index, "this iterator does not expose logical points")
@@ -527,6 +642,28 @@ fn lower_expression(
     }
 }
 
+fn tensor_coordinates(expression: &Expr, rank: usize) -> syn::Result<Vec<&Expr>> {
+    if rank == 1 && !matches!(expression, Expr::Tuple(_)) {
+        return Ok(vec![expression]);
+    }
+    let Expr::Tuple(tuple) = expression else {
+        return Err(syn::Error::new_spanned(
+            expression,
+            format!("rank-{rank} tensor indexing requires a {rank}-coordinate tuple"),
+        ));
+    };
+    if tuple.elems.len() != rank {
+        return Err(syn::Error::new_spanned(
+            tuple,
+            format!(
+                "tensor index has {} coordinates but the tensor rank is {rank}",
+                tuple.elems.len()
+            ),
+        ));
+    }
+    Ok(tuple.elems.iter().collect())
+}
+
 fn lower_pure_block_expression(
     block: &Block,
     context: &DeviceContext<'_>,
@@ -552,20 +689,14 @@ fn index_literal(expression: &Expr) -> syn::Result<usize> {
     index.base10_parse::<usize>()
 }
 
-fn integer_literal(expression: &Expr) -> syn::Result<u32> {
+fn integer_literal(expression: &Expr) -> Option<u32> {
     let Expr::Lit(literal) = expression else {
-        return Err(syn::Error::new_spanned(
-            expression,
-            "device loop bounds must be integer literals",
-        ));
+        return None;
     };
     let Lit::Int(value) = &literal.lit else {
-        return Err(syn::Error::new_spanned(
-            literal,
-            "device loop bounds must be integer literals",
-        ));
+        return None;
     };
-    value.base10_parse::<u32>()
+    value.base10_parse::<u32>().ok()
 }
 
 fn lower_binary_operator(operator: &BinOp) -> syn::Result<BinaryOp> {

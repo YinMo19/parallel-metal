@@ -23,6 +23,22 @@ pub(crate) fn only_tail_expression(block: &Block) -> syn::Result<&Expr> {
     }
 }
 
+pub(crate) fn split_tail_expression(block: &Block) -> syn::Result<(&[Stmt], &Expr)> {
+    let Some((tail, prefix)) = block.stmts.split_last() else {
+        return Err(syn::Error::new_spanned(
+            block,
+            "#[parallel] function body must end with a parallel iterator chain",
+        ));
+    };
+    let Stmt::Expr(expression, None) = tail else {
+        return Err(syn::Error::new_spanned(
+            tail,
+            "#[parallel] function body must end with a parallel iterator chain",
+        ));
+    };
+    Ok((prefix, expression))
+}
+
 pub(crate) fn expect_method<'a>(
     expression: &'a Expr,
     name: &str,
@@ -62,13 +78,13 @@ pub(crate) fn parse_sources(expression: &Expr) -> syn::Result<Vec<IteratorSource
             let Expr::Path(path) = call.receiver.as_ref() else {
                 return Err(syn::Error::new_spanned(
                     &call.receiver,
-                    "parallel_iter() receiver must be a function parameter",
+                    "parallel_iter() receiver must be a simple identifier",
                 ));
             };
             if path.path.segments.len() != 1 {
                 return Err(syn::Error::new_spanned(
                     path,
-                    "parallel_iter() receiver must be a simple function parameter",
+                    "parallel_iter() receiver must be a simple identifier",
                 ));
             }
             Ok(vec![IteratorSource {

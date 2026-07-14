@@ -82,13 +82,26 @@ pub(crate) fn allocate_shared<T: MetalElement>(len: usize) -> Result<Buffer> {
 pub struct BufferBinding<'a> {
     buffer: &'a Buffer,
     elements: usize,
+    extent: Vec<usize>,
+    shape_preserving: bool,
 }
 
 impl<'a> BufferBinding<'a> {
-    pub fn new<T: MetalElement, const D: usize>(tensor: &'a Tensor<T, D>) -> Self {
+    pub fn source<T: MetalElement, const D: usize>(tensor: &'a Tensor<T, D>) -> Self {
         Self {
             buffer: &tensor.buffer,
             elements: tensor.len(),
+            extent: tensor.extent().axes().to_vec(),
+            shape_preserving: true,
+        }
+    }
+
+    pub fn capture<T: MetalElement, const D: usize>(tensor: &'a Tensor<T, D>) -> Self {
+        Self {
+            buffer: &tensor.buffer,
+            elements: tensor.len(),
+            extent: tensor.extent().axes().to_vec(),
+            shape_preserving: false,
         }
     }
 }
@@ -127,13 +140,27 @@ pub fn execute_elementwise<T: MetalElement, const D: usize>(
     }
 
     for input in inputs {
-        if input.elements != elements {
+        if input.shape_preserving && input.elements != elements {
             return Err(Error::ShapeMismatch {
                 expected: elements,
                 actual: input.elements,
             });
         }
     }
+    let input_extents = inputs
+        .iter()
+        .map(|input| {
+            input
+                .extent
+                .iter()
+                .map(|&axis| {
+                    u32::try_from(axis).map_err(|_| Error::TensorTooLarge {
+                        elements: input.elements,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     objc::rc::autoreleasepool(|| {
         with_runtime(|runtime| {
@@ -157,7 +184,16 @@ pub fn execute_elementwise<T: MetalElement, const D: usize>(
                 encoder.set_buffer(index as u64 + 1, Some(input.buffer), 0);
             }
 
-            let scalar_start = inputs.len() as u64 + 1;
+            let input_extent_start = inputs.len() as u64 + 1;
+            for (index, extent) in input_extents.iter().enumerate() {
+                encoder.set_bytes(
+                    input_extent_start + index as u64,
+                    size_of_val(extent.as_slice()) as u64,
+                    extent.as_ptr().cast(),
+                );
+            }
+
+            let scalar_start = inputs.len() as u64 * 2 + 1;
             for (index, scalar) in scalars.iter().enumerate() {
                 encoder.set_bytes(scalar_start + index as u64, scalar.byte_len, scalar.bytes);
             }

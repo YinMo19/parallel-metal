@@ -1,14 +1,13 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use parallel_metal_ir::{ElementKernel, ScalarParam as IrScalarParam, ScalarType};
+use parallel_metal_ir::{ElementKernel, KernelInput, ScalarParam as IrScalarParam, ScalarType};
 use quote::{ToTokens, quote};
-use syn::{Expr, FnArg, Ident, ItemFn, ReturnType};
+use syn::{Expr, FnArg, Ident, ItemFn, Pat, ReturnType, Stmt};
 
-use crate::lower::{lower_device_body, sanitize_identifier, scalar_msl_identifier};
+use crate::lower::{DeviceContext, lower_device_body, sanitize_identifier, scalar_msl_identifier};
 use crate::syntax::{
-    ClosureMode, TensorType, closure_bindings, expect_method, only_tail_expression,
-    parse_extent_type, parse_scalar_type, parse_sources, parse_tensor_type, rank_literal,
-    simple_pat_ident,
+    ClosureMode, TensorType, closure_bindings, expect_method, parse_extent_type, parse_scalar_type,
+    parse_sources, parse_tensor_type, rank_literal, simple_pat_ident, split_tail_expression,
 };
 
 #[derive(Clone)]
@@ -44,6 +43,7 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
     }
 
     let mut tensors = HashMap::<String, TensorParam>::new();
+    let mut tensor_params = Vec::<TensorParam>::new();
     let mut extents = HashMap::<String, ExtentParam>::new();
     let mut scalars = Vec::<ScalarParam>::new();
 
@@ -57,7 +57,9 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
         let ident = simple_pat_ident(&argument.pat)?.clone();
 
         if let Some(ty) = parse_tensor_type(&argument.ty)? {
-            tensors.insert(ident.to_string(), TensorParam { ident, ty });
+            let parameter = TensorParam { ident, ty };
+            tensor_params.push(parameter.clone());
+            tensors.insert(parameter.ident.to_string(), parameter);
         } else if let Some(rank) = parse_extent_type(&argument.ty)? {
             extents.insert(ident.to_string(), ExtentParam { ident, rank });
         } else {
@@ -86,7 +88,33 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
         }
     };
 
-    let chain = only_tail_expression(&function.block)?;
+    let (host_statements, chain) = split_tail_expression(&function.block)?;
+    for statement in host_statements {
+        let Stmt::Local(local) = statement else {
+            continue;
+        };
+        let Ok(ident) = simple_pat_ident(&local.pat).cloned() else {
+            continue;
+        };
+        if let Pat::Type(typed) = &local.pat {
+            if let Some(rank) = parse_extent_type(&typed.ty)? {
+                let parameter = ExtentParam { ident, rank };
+                extents.insert(parameter.ident.to_string(), parameter);
+            } else if let Some(ty) = parse_scalar_type(&typed.ty)? {
+                scalars.push(ScalarParam { ident, ty });
+            }
+        } else if local
+            .init
+            .as_ref()
+            .is_some_and(|initializer| is_extent_constructor(&initializer.expr))
+        {
+            let parameter = ExtentParam {
+                ident,
+                rank: output.rank.clone(),
+            };
+            extents.insert(parameter.ident.to_string(), parameter);
+        }
+    }
     let collect = expect_method(chain, "collect", 0)?;
     let map = expect_method(&collect.receiver, "map", 1)?;
     let closure = match &map.args[0] {
@@ -178,7 +206,29 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
     } else {
         None
     };
-    let bindings = closure_bindings(closure, closure_mode, logical_rank)?;
+    let mut bindings = closure_bindings(closure, closure_mode, logical_rank)?;
+    let tensor_indices = tensor_params
+        .iter()
+        .enumerate()
+        .map(|(index, tensor)| (tensor.ident.to_string(), index))
+        .collect::<HashMap<_, _>>();
+    let source_tensor_indices = input_params
+        .iter()
+        .map(|input| tensor_indices[&input.ident.to_string()])
+        .collect::<Vec<_>>();
+    for input in bindings.values.values_mut() {
+        *input = source_tensor_indices[*input];
+    }
+    let tensor_bindings = tensor_params
+        .iter()
+        .enumerate()
+        .map(|(index, tensor)| {
+            Ok((
+                tensor.ident.to_string(),
+                (index, rank_literal(&tensor.ty.rank)?),
+            ))
+        })
+        .collect::<syn::Result<HashMap<_, _>>>()?;
     let scalar_types = scalars
         .iter()
         .map(|scalar| (scalar.ident.to_string(), scalar.ty))
@@ -189,19 +239,31 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
         .collect::<Vec<_>>();
     let body = lower_device_body(
         &closure.body,
-        &bindings.values,
-        bindings.point.as_deref(),
-        &bindings.point_axes,
-        &extent_names,
-        logical_rank,
-        &scalar_types,
+        DeviceContext {
+            bindings: &bindings.values,
+            tensor_bindings: &tensor_bindings,
+            point_binding: bindings.point.as_deref(),
+            point_axes: &bindings.point_axes,
+            extent_names: &extent_names,
+            logical_rank,
+            scalars: &scalar_types,
+            result_type: output.element,
+        },
     )?;
 
     let function_name = function.sig.ident.to_string();
     let kernel_name = format!("__pm_kernel_{}", sanitize_identifier(&function_name));
     let kernel = ElementKernel {
         name: kernel_name.clone(),
-        inputs: input_params.iter().map(|input| input.ty.element).collect(),
+        inputs: tensor_params
+            .iter()
+            .map(|input| {
+                Ok(KernelInput {
+                    ty: input.ty.element,
+                    rank: rank_literal(&input.ty.rank)?,
+                })
+            })
+            .collect::<syn::Result<Vec<_>>>()?,
         scalars: scalars
             .iter()
             .map(|scalar| IrScalarParam {
@@ -228,9 +290,17 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
         quote!(#ident)
     };
     let other_inputs = input_params.iter().skip(1).map(|input| &input.ident);
-    let input_bindings = input_params.iter().map(|input| {
+    let source_tensor_names = input_params
+        .iter()
+        .map(|input| input.ident.to_string())
+        .collect::<HashSet<_>>();
+    let input_bindings = tensor_params.iter().map(|input| {
         let ident = &input.ident;
-        quote!(::parallel_metal::__private::BufferBinding::new(#ident))
+        if source_tensor_names.contains(&ident.to_string()) {
+            quote!(::parallel_metal::__private::BufferBinding::source(#ident))
+        } else {
+            quote!(::parallel_metal::__private::BufferBinding::capture(#ident))
+        }
     });
     let scalar_bindings = scalars.iter().map(|scalar| {
         let ident = &scalar.ident;
@@ -246,6 +316,7 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
     Ok(quote! {
         #(#attributes)*
         #visibility #signature {
+            #(#host_statements)*
             let __pm_extent = #extent_expression;
             #(
                 assert_eq!(
@@ -267,4 +338,22 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
             })
         }
     })
+}
+
+fn is_extent_constructor(expression: &Expr) -> bool {
+    let Expr::Call(call) = expression else {
+        return false;
+    };
+    let Expr::Path(path) = call.func.as_ref() else {
+        return false;
+    };
+    path.path
+        .segments
+        .iter()
+        .any(|segment| segment.ident == "Extent")
+        && path
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == "new")
 }

@@ -96,10 +96,17 @@ pub(crate) enum ClosureMode {
     Points,
 }
 
+pub(crate) struct ClosureBindings {
+    pub(crate) values: HashMap<String, usize>,
+    pub(crate) point: Option<String>,
+    pub(crate) point_axes: HashMap<String, usize>,
+}
+
 pub(crate) fn closure_bindings(
     closure: &ExprClosure,
     mode: ClosureMode,
-) -> syn::Result<(HashMap<String, usize>, Option<String>)> {
+    point_rank: Option<usize>,
+) -> syn::Result<ClosureBindings> {
     if closure.inputs.len() != 1 {
         return Err(syn::Error::new_spanned(
             &closure.inputs,
@@ -108,6 +115,7 @@ pub(crate) fn closure_bindings(
     }
 
     let mut bindings = HashMap::new();
+    let mut point_axes = HashMap::new();
     let pattern = &closure.inputs[0];
     let point = match mode {
         ClosureMode::Values(1) => {
@@ -149,14 +157,66 @@ pub(crate) fn closure_bindings(
                     "indexed_parallel_iter() map must use |(point, value)|",
                 ));
             }
-            let point = simple_pat_ident(&tuple.elems[0])?.to_string();
+            let point = bind_point_pattern(
+                &tuple.elems[0],
+                point_rank.expect("indexed iteration has a point rank"),
+                &mut point_axes,
+            )?;
             let value = simple_pat_ident(&tuple.elems[1])?.to_string();
             bindings.insert(value, 0);
-            Some(point)
+            point
         }
-        ClosureMode::Points => Some(simple_pat_ident(pattern)?.to_string()),
+        ClosureMode::Points => bind_point_pattern(
+            pattern,
+            point_rank.expect("extent iteration has a point rank"),
+            &mut point_axes,
+        )?,
     };
-    Ok((bindings, point))
+    Ok(ClosureBindings {
+        values: bindings,
+        point,
+        point_axes,
+    })
+}
+
+fn bind_point_pattern(
+    pattern: &Pat,
+    rank: usize,
+    axes: &mut HashMap<String, usize>,
+) -> syn::Result<Option<String>> {
+    if let Ok(ident) = simple_pat_ident(pattern) {
+        return Ok(Some(ident.to_string()));
+    }
+
+    let Pat::Tuple(tuple) = pattern else {
+        return Err(syn::Error::new_spanned(
+            pattern,
+            "point must be bound as `point` or destructured as `(axis0, axis1, ...)`",
+        ));
+    };
+    if tuple.elems.len() != rank {
+        return Err(syn::Error::new_spanned(
+            tuple,
+            format!(
+                "point pattern has {} axes but this iterator has rank {rank}",
+                tuple.elems.len()
+            ),
+        ));
+    }
+
+    for (axis, pattern) in tuple.elems.iter().enumerate() {
+        if matches!(pattern, Pat::Wild(_)) {
+            continue;
+        }
+        let ident = simple_pat_ident(pattern)?;
+        if axes.insert(ident.to_string(), axis).is_some() {
+            return Err(syn::Error::new_spanned(
+                ident,
+                "a point destructuring pattern cannot bind the same name twice",
+            ));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn simple_pat_ident(pattern: &Pat) -> syn::Result<&Ident> {

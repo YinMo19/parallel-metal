@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use parallel_metal_ir::{
     AssignOp, BinaryOp, DeviceBlock, Expr as IrExpr, ScalarType, Statement, UnaryOp,
 };
-use syn::{BinOp, Block, Expr, ExprForLoop, ExprRange, Lit, Local, Pat, RangeLimits, Stmt};
+use syn::{
+    BinOp, Block, Expr, ExprClosure, ExprForLoop, ExprRange, Lit, Local, Pat, RangeLimits, Stmt,
+};
 
 use crate::syntax::{only_tail_expression, parse_scalar_type, simple_pat_ident};
 
@@ -16,6 +18,7 @@ struct LocalInfo {
 struct DeviceContext<'a> {
     bindings: &'a HashMap<String, usize>,
     point_binding: Option<&'a str>,
+    point_axes: &'a HashMap<String, usize>,
     extent_names: &'a [String],
     logical_rank: Option<usize>,
     scalars: &'a HashMap<String, ScalarType>,
@@ -25,6 +28,7 @@ pub(crate) fn lower_device_body(
     expression: &Expr,
     bindings: &HashMap<String, usize>,
     point_binding: Option<&str>,
+    point_axes: &HashMap<String, usize>,
     extent_names: &[String],
     logical_rank: Option<usize>,
     scalars: &HashMap<String, ScalarType>,
@@ -32,6 +36,7 @@ pub(crate) fn lower_device_body(
     let context = DeviceContext {
         bindings,
         point_binding,
+        point_axes,
         extent_names,
         logical_rank,
         scalars,
@@ -166,7 +171,7 @@ fn lower_statement(
                 _ => {
                     return Err(syn::Error::new_spanned(
                         binary,
-                        "only assignment expressions and fixed for loops may be statements",
+                        "only assignment expressions and bounded device loops may be statements",
                     ));
                 }
             };
@@ -178,9 +183,12 @@ fn lower_statement(
             })
         }
         Expr::ForLoop(loop_expression) => lower_for_loop(loop_expression, context, locals),
+        Expr::MethodCall(call) if call.method == "for_each" => {
+            lower_for_each(&call.receiver, &call.args, context, locals)
+        }
         _ => Err(syn::Error::new_spanned(
             expression,
-            "only local assignment and fixed inclusive for loops are device statements",
+            "only local assignment and bounded for/for_each loops are device statements",
         )),
     }
 }
@@ -191,26 +199,7 @@ fn lower_for_loop(
     outer_locals: &HashMap<String, LocalInfo>,
 ) -> syn::Result<Statement> {
     let variable = simple_pat_ident(&loop_expression.pat)?;
-    let Expr::Range(ExprRange {
-        start: Some(start),
-        limits: RangeLimits::Closed(_),
-        end: Some(end),
-        ..
-    }) = loop_expression.expr.as_ref()
-    else {
-        return Err(syn::Error::new_spanned(
-            &loop_expression.expr,
-            "device loops currently require a literal inclusive range such as 1..=8",
-        ));
-    };
-    let start = integer_literal(start)?;
-    let end = integer_literal(end)?;
-    if start > end {
-        return Err(syn::Error::new_spanned(
-            loop_expression,
-            "device loop start must not exceed its end",
-        ));
-    }
+    let (start, end, inclusive) = fixed_range(&loop_expression.expr)?;
 
     let rust_name = variable.to_string();
     let msl_name = loop_msl_identifier(&rust_name);
@@ -222,19 +211,139 @@ fn lower_for_loop(
             mutable: false,
         },
     );
-    let (body, result) = lower_block_parts(&loop_expression.body, context, &mut locals)?;
-    if result.is_some() {
-        return Err(syn::Error::new_spanned(
-            &loop_expression.body,
-            "a device for-loop body cannot return a value",
-        ));
-    }
-    Ok(Statement::ForRangeInclusive {
+    let body = lower_unit_block(&loop_expression.body, context, &mut locals)?;
+    Ok(Statement::ForRange {
         variable: msl_name,
         start,
         end,
+        inclusive,
         body,
     })
+}
+
+fn lower_for_each(
+    receiver: &Expr,
+    arguments: &syn::punctuated::Punctuated<Expr, syn::token::Comma>,
+    context: &DeviceContext<'_>,
+    outer_locals: &HashMap<String, LocalInfo>,
+) -> syn::Result<Statement> {
+    if arguments.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            arguments,
+            "device range for_each expects exactly one closure",
+        ));
+    }
+    let Expr::Closure(closure) = &arguments[0] else {
+        return Err(syn::Error::new_spanned(
+            &arguments[0],
+            "device range for_each requires an inline closure",
+        ));
+    };
+    if closure.inputs.len() != 1 {
+        return Err(syn::Error::new_spanned(
+            &closure.inputs,
+            "device range for_each closure must have exactly one argument",
+        ));
+    }
+
+    let variable = simple_pat_ident(&closure.inputs[0])?;
+    let (start, end, inclusive) = fixed_range(receiver)?;
+    let rust_name = variable.to_string();
+    let msl_name = loop_msl_identifier(&rust_name);
+    let mut locals = outer_locals.clone();
+    locals.insert(
+        rust_name,
+        LocalInfo {
+            msl_name: msl_name.clone(),
+            mutable: false,
+        },
+    );
+    let body = lower_loop_closure_body(closure, context, &mut locals)?;
+
+    Ok(Statement::ForRange {
+        variable: msl_name,
+        start,
+        end,
+        inclusive,
+        body,
+    })
+}
+
+fn lower_loop_closure_body(
+    closure: &ExprClosure,
+    context: &DeviceContext<'_>,
+    locals: &mut HashMap<String, LocalInfo>,
+) -> syn::Result<Vec<Statement>> {
+    if let Expr::Block(block) = closure.body.as_ref() {
+        lower_unit_block(&block.block, context, locals)
+    } else {
+        Ok(vec![lower_statement(&closure.body, context, locals)?])
+    }
+}
+
+fn lower_unit_block(
+    block: &Block,
+    context: &DeviceContext<'_>,
+    locals: &mut HashMap<String, LocalInfo>,
+) -> syn::Result<Vec<Statement>> {
+    let mut statements = Vec::new();
+    for statement in &block.stmts {
+        match statement {
+            Stmt::Local(local) => statements.push(lower_local(local, context, locals)?),
+            Stmt::Expr(expression, _) => {
+                statements.push(lower_statement(expression, context, locals)?);
+            }
+            Stmt::Item(item) => {
+                return Err(syn::Error::new_spanned(
+                    item,
+                    "items are not supported inside a device loop",
+                ));
+            }
+            Stmt::Macro(statement) => {
+                return Err(syn::Error::new_spanned(
+                    statement,
+                    "macros are not supported inside a device loop",
+                ));
+            }
+        }
+    }
+    Ok(statements)
+}
+
+fn fixed_range(expression: &Expr) -> syn::Result<(u32, u32, bool)> {
+    let expression = strip_grouping(expression);
+    let Expr::Range(ExprRange {
+        start: Some(start),
+        limits,
+        end: Some(end),
+        ..
+    }) = expression
+    else {
+        return Err(syn::Error::new_spanned(
+            expression,
+            "device loops require a bounded literal range such as 0..8 or 1..=8",
+        ));
+    };
+    let start = integer_literal(start)?;
+    let end = integer_literal(end)?;
+    let inclusive = matches!(limits, RangeLimits::Closed(_));
+    if inclusive && end == u32::MAX {
+        return Err(syn::Error::new_spanned(
+            expression,
+            "an inclusive device loop cannot end at u32::MAX",
+        ));
+    }
+    Ok((start, end, inclusive))
+}
+
+fn strip_grouping(mut expression: &Expr) -> &Expr {
+    loop {
+        expression = match expression {
+            Expr::Paren(paren) => &paren.expr,
+            Expr::Group(group) => &group.expr,
+            _ => return expression,
+        };
+    }
 }
 
 fn assignment_target(
@@ -311,6 +420,8 @@ fn lower_expression(
             let name = path.path.segments[0].ident.to_string();
             if let Some(index) = context.bindings.get(&name) {
                 Ok(IrExpr::Input(*index))
+            } else if let Some(axis) = context.point_axes.get(&name) {
+                Ok(IrExpr::PointAxis(*axis))
             } else if context.scalars.contains_key(&name) {
                 Ok(IrExpr::Scalar(scalar_msl_identifier(&name)))
             } else if let Some(local) = locals.get(&name) {

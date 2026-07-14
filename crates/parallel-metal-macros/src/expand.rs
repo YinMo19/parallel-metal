@@ -173,12 +173,12 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
     } else {
         ClosureMode::Values(sources.len())
     };
-    let (bindings, point_binding) = closure_bindings(closure, closure_mode)?;
-    let logical_rank = if point_binding.is_some() {
+    let logical_rank = if matches!(closure_mode, ClosureMode::Points | ClosureMode::Indexed) {
         Some(rank_literal(source_rank)?)
     } else {
         None
     };
+    let bindings = closure_bindings(closure, closure_mode, logical_rank)?;
     let scalar_types = scalars
         .iter()
         .map(|scalar| (scalar.ident.to_string(), scalar.ty))
@@ -189,8 +189,9 @@ pub(crate) fn parallel(function: ItemFn) -> syn::Result<proc_macro2::TokenStream
         .collect::<Vec<_>>();
     let body = lower_device_body(
         &closure.body,
-        &bindings,
-        point_binding.as_deref(),
+        &bindings.values,
+        bindings.point.as_deref(),
+        &bindings.point_axes,
         &extent_names,
         logical_rank,
         &scalar_types,

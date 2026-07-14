@@ -4,12 +4,12 @@ use parallel_metal::{Extent, Tensor, parallel};
 fn render(extent: Extent<2>, time: f32) -> Tensor<u32, 2> {
     extent
         .parallel_iter()
-        .map(|point| point[0] as u32 * 0x0001_0000 + point[1] as u32 * 0x0000_0100 + time as u32)
+        .map(|(x, y)| x as u32 * 0x0001_0000 + y as u32 * 0x0000_0100 + time as u32)
         .collect()
 }
 
 fn main() {
-    let extent = Extent::new([1080, 1920]);
+    let extent = Extent::new([1920, 1080]);
     let pixels = render(extent, 42.0);
 
     println!("extent: {:?}", pixels.extent());

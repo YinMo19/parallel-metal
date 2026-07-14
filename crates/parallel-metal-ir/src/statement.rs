@@ -35,10 +35,11 @@ pub enum Statement {
         op: AssignOp,
         value: Expr,
     },
-    ForRangeInclusive {
+    ForRange {
         variable: String,
         start: u32,
         end: u32,
+        inclusive: bool,
         body: Vec<Self>,
     },
 }
@@ -57,15 +58,17 @@ impl Statement {
                 value.write_msl(output);
                 output.push_str(";\n");
             }
-            Self::ForRangeInclusive {
+            Self::ForRange {
                 variable,
                 start,
                 end,
+                inclusive,
                 body,
             } => {
+                let comparison = if *inclusive { "<=" } else { "<" };
                 writeln!(
                     output,
-                    "{indent}for (uint {variable} = {start}; {variable} <= {end}; ++{variable}) {{"
+                    "{indent}for (uint {variable} = {start}; {variable} {comparison} {end}; ++{variable}) {{"
                 )
                 .unwrap();
                 for statement in body {

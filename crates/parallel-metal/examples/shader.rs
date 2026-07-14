@@ -10,11 +10,11 @@ use parallel_metal::{Extent, Tensor, parallel};
 fn shader(extent: Extent<2>, time: f32) -> Tensor<u32, 2> {
     extent
         .parallel_iter()
-        .map(|point| {
+        .map(|(x, y)| {
             // p = (frag_coord * 2.0 - resolution) / resolution.y
-            let px: f32 = ((point[1] as f32 + 0.5) * 2.0 - extent[1] as f32) / extent[0] as f32;
-            let py: f32 = (((extent[0] - 1 - point[0]) as f32 + 0.5) * 2.0 - extent[0] as f32)
-                / extent[0] as f32;
+            let px: f32 = ((x as f32 + 0.5) * 2.0 - extent[0] as f32) / extent[1] as f32;
+            let py: f32 =
+                (((extent[1] - 1 - y) as f32 + 0.5) * 2.0 - extent[1] as f32) / extent[1] as f32;
 
             let l: f32 = abs(0.7 - (px * px + py * py));
             let mut vx: f32 = px * (1.0 - l) / 0.2;
@@ -24,7 +24,7 @@ fn shader(extent: Extent<2>, time: f32) -> Tensor<u32, 2> {
             let mut oa: f32 = 0.0;
 
             // Original golfed loop: i++ < 8, update v, then accumulate o.
-            for iteration in 1..=8 {
+            (1..=8).for_each(|iteration| {
                 let i: f32 = iteration as f32;
                 let dx: f32 = cos(vy * i + time) / i + 0.7;
                 let dy: f32 = cos(vx * i + i + time) / i + 0.7;
@@ -35,7 +35,7 @@ fn shader(extent: Extent<2>, time: f32) -> Tensor<u32, 2> {
                 ox += (sin(vx) + 1.0) * distance;
                 oy += (sin(vy) + 1.0) * distance;
                 oa += (sin(vx) + 1.0) * distance;
-            }
+            });
 
             let attenuation: f32 = exp(-4.0 * l);
             let red: f32 = tanh(exp(py) * attenuation / ox);
@@ -52,7 +52,7 @@ fn shader(extent: Extent<2>, time: f32) -> Tensor<u32, 2> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let extent = Extent::new([256, 512]);
+    let extent = Extent::new([512, 256]);
     let pixels = shader(extent, 1.0);
     let output = std::env::args_os()
         .nth(1)
@@ -61,7 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // PPM keeps the example dependency-free. This loop is ordinary CPU work
     // reading the exact shared allocation that the GPU just wrote.
-    let mut ppm = format!("P6\n{} {}\n255\n", extent[1], extent[0]).into_bytes();
+    let mut ppm = format!("P6\n{} {}\n255\n", extent[0], extent[1]).into_bytes();
     ppm.reserve(pixels.len() * 3);
     for &pixel in pixels.as_slice() {
         ppm.extend_from_slice(&[

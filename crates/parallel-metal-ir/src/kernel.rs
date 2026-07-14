@@ -68,13 +68,13 @@ impl ElementKernel {
         source.push_str("    if (__pm_linear < __pm_count) {\n");
         if let Some(rank) = self.logical_rank {
             source.push_str("        uint __pm_remaining = __pm_linear;\n");
-            for axis in (0..rank).rev() {
+            for axis in 0..rank {
                 writeln!(
                     source,
                     "        uint __pm_point{axis} = __pm_remaining % __pm_extent[{axis}];"
                 )
                 .unwrap();
-                if axis != 0 {
+                if axis + 1 != rank {
                     writeln!(source, "        __pm_remaining /= __pm_extent[{axis}];").unwrap();
                 }
             }
@@ -134,8 +134,9 @@ mod tests {
         };
 
         let source = kernel.to_msl();
-        assert!(source.contains("uint __pm_point2 = __pm_remaining % __pm_extent[2]"));
+        assert!(source.contains("uint __pm_point0 = __pm_remaining % __pm_extent[0]"));
         assert!(source.contains("uint __pm_point1 = __pm_remaining % __pm_extent[1]"));
+        assert!(source.contains("__pm_remaining /= __pm_extent[0]"));
         assert!(source.contains("__pm_out[__pm_linear] = __pm_point1"));
     }
 }

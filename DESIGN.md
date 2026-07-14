@@ -125,9 +125,9 @@ pub struct Tensor<T, const D: usize> {
 
 ```rust,ignore
 let vector_extent = Extent::<1>::new([2 << 20]);
-let image_extent = Extent::<2>::new([1080, 1920]);
-let volume_extent = Extent::<3>::new([128, 256, 256]);
-let batch_extent = Extent::<4>::new([8, 4, 1080, 1920]);
+let image_extent = Extent::<2>::new([1920, 1080]);
+let volume_extent = Extent::<3>::new([256, 256, 128]);
+let batch_extent = Extent::<4>::new([1920, 1080, 4, 8]);
 ```
 
 使用运行期 extent 而不是把每条轴都放入 const generic，原因是：
@@ -142,22 +142,24 @@ let batch_extent = Extent::<4>::new([8, 4, 1080, 1920]);
 
 ### 3.2 轴顺序和连续布局
 
-默认采用 row-major 布局，最后一条轴连续：
+默认采用 axis-0-contiguous 布局，第一条轴连续：
 
 ```text
 extent  = [D0, D1, ..., Dn]
-stride[n] = 1
-stride[k] = extent[k + 1] * stride[k + 1]
+stride[0] = 1
+stride[k] = extent[k - 1] * stride[k - 1]
 offset(point) = Σ point[k] * stride[k]
 ```
 
 因此：
 
-- 二维图像使用 `[height, width]` 和 `[y, x]`；
-- 三维体数据使用 `[depth, height, width]` 和 `[z, y, x]`；
-- 机器学习数据可以使用 `[batch, channel, height, width]`。
+- 二维图像使用 `[width, height]` 和 `[x, y]`；
+- 三维体数据使用 `[width, height, depth]` 和 `[x, y, z]`；
+- 四维及以上仍按 axis 0、axis 1、axis 2、axis 3 的顺序排列，业务含义由应用定义。
 
-这与 Rust 的 `[[T; WIDTH]; HEIGHT]` 以及常见 tensor 库的连续布局一致。
+二维 offset 为 `x + width * y`，三维 offset 为
+`x + width * (y + height * z)`。它直接匹配 Metal 的 `(x, y, z)` 坐标直觉；导入采用
+NCHW 等其他布局的数据时，必须通过显式 view、transpose 或复制转换，不能暗中改变轴语义。
 
 所有 extent 乘法和 byte size 计算必须检查溢出。`D == 0` 不作为 tensor；scalar 单独处理。
 
@@ -209,9 +211,9 @@ extent
 
 | 逻辑 rank | 默认物理映射 |
 | --- | --- |
-| 1 | 最后一轴映射到 Metal x |
-| 2 | 最后一轴映射到 x，倒数第二轴映射到 y |
-| 3 | 最后三轴分别映射到 x、y、z |
+| 1 | axis 0 映射到 Metal x |
+| 2 | axis 0、1 分别映射到 Metal x、y |
+| 3 | axis 0、1、2 分别映射到 Metal x、y、z |
 | 大于 3 | 生成 linear id，再根据 extent/strides 恢复 `Point<D>` |
 
 即使 `D <= 3`，调度器也允许为了设备限制或 tiling 改用线性映射。算法只能依赖逻辑 point，
@@ -223,7 +225,7 @@ extent
 
 ```text
 remaining = linear_id
-for axis from D-1 down to 0:
+for axis from 0 up to D-1:
     point[axis] = remaining % extent[axis]
     remaining   = remaining / extent[axis]
 ```
@@ -268,6 +270,24 @@ tensor.indexed_parallel_iter()  // item = (Point<D>, &T)
 extent.parallel_iter()          // item = Point<D>
 view.parallel_iter()            // item = &T，保留 view extent/strides
 ```
+
+固定 rank 的坐标允许直接按轴解构。tuple 顺序严格等于 `Extent` 的轴顺序；空间 domain 的
+正式约定是 `[width, height, depth]` 对应 `(x, y, z)`：
+
+```rust,ignore
+Extent::new([width, height])
+    .parallel_iter()
+    .map(|(x, y)| shade(x, y))
+
+volume
+    .indexed_parallel_iter()
+    .map(|((x, y, z), value)| transform(x, y, z, *value))
+```
+
+整体 `|point|` 与解构写法都属于正式语法。二维、三维 shader 通常用解构更易读；需要按
+axis 编写通用算法、传递完整坐标或 rank 较高的时候，`point[axis]` 更稳定。`|(x, y)|`
+不是 Rust 对 `Point<D>` 结构体本身的原生 pattern，而是 `#[parallel]` device DSL 在类型检查
+前识别并降低的坐标 pattern。
 
 `enumerate()` 保持 Rust 直觉，返回线性 `(usize, item)`；需要 N 维坐标时使用明确的
 `indexed_parallel_iter()`，避免让 `enumerate()` 在不同 rank 下偷偷改变含义。
@@ -355,6 +375,42 @@ primitive。
 不是每个标准 iterator 方法都应该立即支持。无法保证 shape、有限执行或 device 语义的
 adapter 必须在宏展开时报清晰错误，不能悄悄回到 CPU 或改变复杂度。
 
+### 5.5 两种 iterator 层级
+
+device closure 内还可以有普通的、每线程局部的有限迭代。它和外层数据并行 chain 不属于
+同一层：
+
+```rust,ignore
+extent.parallel_iter()                 // 跨 point 并行，一个 point 一个 GPU thread
+    .map(|(x, y)| {
+        let mut light: f32 = 0.0;
+        (0..8).for_each(|sample| {      // 当前 GPU thread 内的局部循环
+            light += trace(x, y, sample);
+        });
+        light
+    })
+    .collect()
+```
+
+`for sample in 0..8` 和 `(0..8).for_each(...)` 降到相同的 device loop IR，因此只是表达风格
+不同，不会产生八次 dispatch。第一阶段只接受编译期可证明有限的整数范围。后续可支持局部
+iterator 的 `map`、`fold`、`sum`、`any`、`all`；它们仍在单个 GPU thread 内执行，也必须有
+静态上界，不能分配 heap 或产生动态长度集合。
+
+外层 parallel iterator 按执行代价分组扩展：
+
+| 类别 | 方法 | lowering 约束 |
+| --- | --- | --- |
+| 单 pass 可融合 | `map`、`zip`、`copied`、`enumerate`、`take`、`skip` | 尽量融合为一个 kernel；domain 变化必须静态可计算 |
+| 邻域/重排 | `gather`、`windows`、`chunks`、view adapters | 单 pass，但必须携带 shape、stride 和边界策略 |
+| reduction terminal | `fold`、`reduce`、`sum`、`min`、`max`、`any`、`all` | 多级 reduction，整数与浮点结合顺序需要明确 |
+| 多 pass adapter | `scan`、`filter`、`flat_map` | 需要中间 buffer；动态 cardinality 不能伪装成普通 `map` |
+| 冲突写入 | `scatter`、`for_each` 写外部 tensor | 默认拒绝；只有 atomic 或可证明无冲突时开放 |
+
+目标是覆盖 GPU 上有明确语义的常用 iterator 组合，而不是声称任意 `std::iter::Iterator`
+都能并行化。尤其外层 `for_each` 若允许任意 shared mutation，会破坏当前“一个 point 只写
+一个输出”的无竞争模型；生成 tensor 仍优先用 `map(...).collect()`。
+
 ## 6. 1D、2D、3D 和更高维示例
 
 ### 6.1 一维 XOR
@@ -380,12 +436,10 @@ fn xor(left: &Tensor<u64, 1>, right: &Tensor<u64, 1>)
 fn render(extent: Extent<2>, params: Params) -> Tensor<Rgba8, 2> {
     extent
         .parallel_iter()
-        .map(|point| {
-            let y = point[0];
-            let x = point[1];
+        .map(|(x, y)| {
             let uv = Vec2::new(
-                x as f32 / extent[1] as f32,
-                y as f32 / extent[0] as f32,
+                x as f32 / extent[0] as f32,
+                y as f32 / extent[1] as f32,
             );
 
             shade(uv, params)
@@ -403,12 +457,12 @@ fn diffuse(input: &Tensor<f32, 3>) -> Tensor<f32, 3> {
         .indexed_parallel_iter()
         .map(|(point, _value)| {
             let center = input.sample(point, Boundary::Clamp);
-            let left   = input.sample(point.offset([0, 0, -1]), Boundary::Clamp);
-            let right  = input.sample(point.offset([0, 0,  1]), Boundary::Clamp);
+            let left   = input.sample(point.offset([-1, 0, 0]), Boundary::Clamp);
+            let right  = input.sample(point.offset([ 1, 0, 0]), Boundary::Clamp);
             let up     = input.sample(point.offset([0, -1, 0]), Boundary::Clamp);
             let down   = input.sample(point.offset([0,  1, 0]), Boundary::Clamp);
-            let front  = input.sample(point.offset([-1, 0, 0]), Boundary::Clamp);
-            let back   = input.sample(point.offset([ 1, 0, 0]), Boundary::Clamp);
+            let front  = input.sample(point.offset([0, 0, -1]), Boundary::Clamp);
+            let back   = input.sample(point.offset([0, 0,  1]), Boundary::Clamp);
 
             (center + left + right + up + down + front + back) / 7.0
         })
@@ -751,7 +805,7 @@ parallel-metal/
 以下是本草案给出的明确建议：
 
 1. 核心容器采用 `Tensor<T, const D: usize>`，具体 extent 运行期保存。
-2. 采用 row-major、最后一轴连续的默认布局。
+2. 采用 axis 0 连续的默认布局；空间坐标按 `(x, y, z)` 排列。
 3. `Array/Image/Volume` 只是 rank 便利层，不是独立 backend。
 4. 用户算法只看 `Point<D>`；物理 Metal grid 最多三维且由调度器决定。
 5. `D > 3` 使用 linearization/unflatten，不限制逻辑 rank。

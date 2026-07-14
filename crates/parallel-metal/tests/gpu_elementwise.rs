@@ -20,7 +20,7 @@ fn affine_4d(input: &Tensor<f32, 4>, scale: f32, bias: f32) -> Tensor<f32, 4> {
 fn coordinates_2d(extent: Extent<2>) -> Tensor<u32, 2> {
     extent
         .parallel_iter()
-        .map(|point| point[0] as u32 * 10_000 + point[1] as u32)
+        .map(|(x, y)| x as u32 * 10_000 + y as u32)
         .collect()
 }
 
@@ -42,9 +42,7 @@ fn coordinates_5d(extent: Extent<5>) -> Tensor<u32, 5> {
 fn indexed_3d(input: &Tensor<u32, 3>, scale: u32) -> Tensor<u32, 3> {
     input
         .indexed_parallel_iter()
-        .map(|(point, value)| {
-            *value + point[0] as u32 * scale + point[1] as u32 * 10 + point[2] as u32
-        })
+        .map(|((x, y, z), value)| *value + x as u32 * scale + y as u32 * 10 + z as u32)
         .collect()
 }
 
@@ -54,10 +52,10 @@ fn wave(extent: Extent<1>, time: f32) -> Tensor<f32, 1> {
         .parallel_iter()
         .map(|point| {
             let mut value: f32 = 0.0;
-            for iteration in 1..=4 {
-                let divisor: f32 = iteration as f32;
-                value += sin(point[0] as f32 / divisor + time);
-            }
+            (0..4).for_each(|iteration| {
+                let divisor: f32 = (iteration + 1) as f32;
+                value += sin(point[0] as f32 / divisor + time)
+            });
             tanh(value)
         })
         .collect()
@@ -104,15 +102,15 @@ fn cpu_write_then_gpu_map_preserves_four_dimensional_shape() {
 
 #[test]
 fn extent_iterator_reconstructs_two_dimensional_points() {
-    let extent = Extent::new([37, 53]);
+    let extent = Extent::new([53, 37]);
     let output = coordinates_2d(extent);
 
     assert_eq!(output.extent(), extent);
-    for y in 0..extent[0] {
-        for x in 0..extent[1] {
+    for y in 0..extent[1] {
+        for x in 0..extent[0] {
             assert_eq!(
-                output.as_slice()[y * extent[1] + x],
-                (y * 10_000 + x) as u32
+                output.as_slice()[x + extent[0] * y],
+                (x * 10_000 + y) as u32
             );
         }
     }
@@ -120,17 +118,17 @@ fn extent_iterator_reconstructs_two_dimensional_points() {
 
 #[test]
 fn indexed_iterator_reconstructs_three_dimensional_points() {
-    let extent = Extent::new([5, 7, 11]);
+    let extent = Extent::new([11, 7, 5]);
     let input = Tensor::from_fn(extent, |_| 100u32).unwrap();
     let output = indexed_3d(&input, 100);
 
-    for z in 0..extent[0] {
+    for z in 0..extent[2] {
         for y in 0..extent[1] {
-            for x in 0..extent[2] {
-                let linear = (z * extent[1] + y) * extent[2] + x;
+            for x in 0..extent[0] {
+                let linear = x + extent[0] * (y + extent[1] * z);
                 assert_eq!(
                     output.as_slice()[linear],
-                    100 + z as u32 * 100 + y as u32 * 10 + x as u32
+                    100 + x as u32 * 100 + y as u32 * 10 + z as u32
                 );
             }
         }

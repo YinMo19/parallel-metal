@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/parallel-metal",
+    "crates/parallel-metal-ir",
+    "crates/parallel-metal-macros",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/YinMo19/parallel-metal"
+rust-version = "1.85"
+
+[workspace.dependencies]
+parallel-metal-ir = { path = "crates/parallel-metal-ir" }
+parallel-metal-macros = { path = "crates/parallel-metal-macros" }
+proc-macro2 = "1.0"
+quote = "1.0"
+syn = { version = "2.0", features = ["full", "extra-traits"] }
